@@ -15,9 +15,10 @@ import (
 )
 
 type options struct {
-	selection     string
-	namespace     string
-	allNamespaces bool
+	selection        string
+	namespace        string
+	allNamespaces    bool
+	summaryCondition string
 }
 
 func parseArgs(args []string, stderr io.Writer) (options, error) {
@@ -28,8 +29,10 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 	flags.StringVar(&opts.namespace, "namespace", "", "Namespace")
 	flags.BoolVar(&opts.allNamespaces, "A", false, "All namespaces")
 	flags.BoolVar(&opts.allNamespaces, "all-namespaces", false, "All namespaces")
+	flags.StringVar(&opts.summaryCondition, "s", "", "Show only the specified condition type when True")
+	flags.StringVar(&opts.summaryCondition, "summary-condition", "", "Show only the specified condition type when True")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: kubectl status [-n NAMESPACE | -A] TYPE[/NAME] | TYPE[,TYPE...]")
+		fmt.Fprintln(stderr, "Usage: kubectl status [-s CONDITION] [-n NAMESPACE | -A] TYPE[/NAME] | TYPE[,TYPE...]")
 		fmt.Fprintln(stderr, "Shows conditions for selected resources (newest transition first).")
 		flags.PrintDefaults()
 	}
@@ -38,18 +41,25 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 	// allows flags on either side of the resource selection.
 	ordered := make([]string, 0, len(args))
 	positionals := make([]string, 0, 1)
+	summarySpecified := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
-		case arg == "-n" || arg == "--namespace":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a namespace", arg)
+		case arg == "-n" || arg == "--namespace" || arg == "-s" || arg == "--summary-condition":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return opts, fmt.Errorf("%s requires a value", arg)
+			}
+			if arg == "-s" || arg == "--summary-condition" {
+				summarySpecified = true
 			}
 			ordered = append(ordered, arg, args[i+1])
 			i++
 		case arg == "-A" || arg == "--all-namespaces" || arg == "-h" || arg == "--help":
 			ordered = append(ordered, arg)
-		case strings.HasPrefix(arg, "-n=") || strings.HasPrefix(arg, "--namespace="):
+		case strings.HasPrefix(arg, "-n=") || strings.HasPrefix(arg, "--namespace=") || strings.HasPrefix(arg, "-s=") || strings.HasPrefix(arg, "--summary-condition="):
+			if strings.HasPrefix(arg, "-s=") || strings.HasPrefix(arg, "--summary-condition=") {
+				summarySpecified = true
+			}
 			ordered = append(ordered, arg)
 		case strings.HasPrefix(arg, "-"):
 			return opts, fmt.Errorf("unsupported flag %q", arg)
@@ -62,6 +72,9 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 	}
 	if opts.namespace != "" && opts.allNamespaces {
 		return opts, errors.New("-n and -A cannot be used together")
+	}
+	if summarySpecified && strings.TrimSpace(opts.summaryCondition) == "" {
+		return opts, errors.New("summary condition must not be empty")
 	}
 	if flags.NArg() == 0 {
 		flags.Usage()
@@ -173,7 +186,7 @@ func transitionTime(c condition) time.Time {
 	return t
 }
 
-func render(w io.Writer, resources []resource) error {
+func render(w io.Writer, resources []resource, summaryCondition string) error {
 	if len(resources) == 0 {
 		_, err := fmt.Fprintln(w, "No resources found")
 		return err
@@ -198,8 +211,19 @@ func render(w io.Writer, resources []resource) error {
 			continue
 		}
 		conditions := append([]condition(nil), r.Status.Conditions...)
+		if summaryCondition != "" {
+			var matches []condition
+			for _, c := range conditions {
+				if c.Type == summaryCondition && c.Status == "True" {
+					matches = append(matches, c)
+				}
+			}
+			if len(matches) > 0 {
+				conditions = matches
+			}
+		}
 		sort.SliceStable(conditions, func(i, j int) bool {
-			return transitionTime(conditions[i]).Before(transitionTime(conditions[j]))
+			return transitionTime(conditions[i]).After(transitionTime(conditions[j]))
 		})
 		table := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 		if _, err := fmt.Fprintln(table, "TYPE\tSTATUS\tREASON\tMESSAGE\tLAST TRANSITION TIME"); err != nil {
@@ -228,7 +252,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	resources, err := fetch(opts)
 	if err == nil {
-		err = render(stdout, resources)
+		err = render(stdout, resources, opts.summaryCondition)
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "kubectl status:", err)
